@@ -9,6 +9,7 @@ import (
 	"path"
 
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -59,16 +60,18 @@ type Options struct {
 
 // Fs represents a remote icloud drive
 type Fs struct {
-	name     string // name of this remote
-	root     string // the path we are working on.
-	rootID   string
-	opt      Options            // parsed config options
-	m        configmap.Mapper   // config map for persisting auth state
-	features *fs.Features       // optional features
-	dirCache *dircache.DirCache // Map of directory path to directory id
-	icloud   *api.Client
-	service  *api.DriveService
-	pacer    *fs.Pacer // pacer for API calls
+	name          string // name of this remote
+	root          string // the path we are working on.
+	rootID        string
+	opt           Options            // parsed config options
+	m             configmap.Mapper   // config map for persisting auth state
+	features      *fs.Features       // optional features
+	dirCache      *dircache.DirCache // Map of directory path to directory id
+	icloud        *api.Client
+	service       *api.DriveService
+	sharedItemIDs map[string]string
+	sharedItems   map[string]*api.DriveItem
+	pacer         *fs.Pacer // pacer for API calls
 }
 
 // Object describes an icloud drive object
@@ -83,6 +86,7 @@ type Object struct {
 	itemID      string    // item ID of the object
 	etag        string
 	downloadURL string
+	shared      bool
 }
 
 // find item by path. Will not return any children for the item
@@ -107,6 +111,10 @@ func (f *Fs) findLeafItem(ctx context.Context, pathID string, leaf string) (item
 		return nil, false, err
 	}
 	for _, item := range items {
+		if item.Itemid != "" && item.Drivewsid != "" {
+			f.sharedItemIDs[item.Drivewsid] = item.Itemid
+			f.sharedItems[item.Drivewsid] = item
+		}
 		// iCloud returns file names in NFD Unicode normalization, so normalized to NFC for consistent comparison
 		if strings.EqualFold(norm.NFC.String(item.FullName()), leaf) {
 			return item, true, nil
@@ -133,6 +141,11 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID string, leaf string) (pathIDOu
 		return "", false, fs.ErrorIsFile
 	}
 
+	if item.Itemid != "" && (item.ShareID.ShareName != "" || strings.Contains(item.Drivewsid, "SHARED_FOLDER::") || strings.Contains(item.Drivewsid, "FOLDER_IN_SHARED_FOLDER::")) {
+		key := "SHARED::" + item.Itemid
+		f.sharedItems[key] = item
+		return f.IDJoin(key, item.Etag), true, nil
+	}
 	return f.IDJoin(item.Drivewsid, item.Etag), true, nil
 }
 
@@ -196,7 +209,157 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	return f.purgeCheck(ctx, dir, false)
 }
 
+func (f *Fs) recentlyDeleted(ctx context.Context) ([]*api.DriveItem, error) {
+	var items []*api.DriveItem
+	var resp *http.Response
+	var err error
+	if err = f.pacer.Call(func() (bool, error) {
+		items, resp, err = f.service.GetRecentlyDeleted(ctx)
+		return shouldRetry(ctx, resp, err)
+	}); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func (f *Fs) selectRecentlyDeleted(items []*api.DriveItem, selectors []string, allowAll bool) ([]*api.DriveItem, error) {
+	if len(selectors) == 0 {
+		if !allowAll {
+			return nil, fmt.Errorf("at least one Recently Deleted item name or drivewsid is required")
+		}
+		return append([]*api.DriveItem(nil), items...), nil
+	}
+	selected := make([]*api.DriveItem, 0, len(selectors))
+	seen := make(map[string]struct{}, len(selectors))
+	for _, selector := range selectors {
+		selector = strings.TrimSpace(selector)
+		if selector == "" {
+			return nil, fmt.Errorf("Recently Deleted selector must not be empty")
+		}
+		var matches []*api.DriveItem
+		for _, item := range items {
+			if item == nil {
+				continue
+			}
+			name := norm.NFC.String(f.opt.Enc.ToStandardName(item.FullName()))
+			if selector == item.Drivewsid || norm.NFC.String(selector) == name {
+				matches = append(matches, item)
+			}
+		}
+		if len(matches) == 0 {
+			return nil, fmt.Errorf("Recently Deleted item %q not found", selector)
+		}
+		if len(matches) != 1 {
+			return nil, fmt.Errorf("Recently Deleted item %q is ambiguous; use its drivewsid", selector)
+		}
+		item := matches[0]
+		if _, ok := seen[item.Drivewsid]; ok {
+			return nil, fmt.Errorf("Recently Deleted item %q selected more than once", selector)
+		}
+		seen[item.Drivewsid] = struct{}{}
+		selected = append(selected, item)
+	}
+	return selected, nil
+}
+
+func (f *Fs) mutateRecentlyDeleted(ctx context.Context, items []*api.DriveItem, recover bool) error {
+	if len(items) == 0 {
+		return nil
+	}
+	requested := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if item == nil || item.Drivewsid == "" {
+			return fmt.Errorf("Recently Deleted item identity unavailable")
+		}
+		requested[item.Drivewsid] = struct{}{}
+	}
+	var mutationErr error
+	// The callback always returns retry=false. Apple writes must be submitted
+	// once, then resolved using an independent authenticated READ.
+	_ = f.pacer.Call(func() (bool, error) {
+		if recover {
+			_, mutationErr = f.service.RecoverItems(ctx, items)
+		} else {
+			_, mutationErr = f.service.PermanentlyDeleteItems(ctx, items)
+		}
+		return false, mutationErr
+	})
+	remaining, readErr := f.recentlyDeleted(ctx)
+	if readErr != nil {
+		if mutationErr != nil {
+			return fmt.Errorf("Recently Deleted mutation outcome is ambiguous (%v); reconciliation failed: %w", mutationErr, readErr)
+		}
+		return fmt.Errorf("Recently Deleted mutation returned success but reconciliation failed: %w", readErr)
+	}
+	var unresolved []string
+	for _, item := range remaining {
+		if item != nil {
+			if _, ok := requested[item.Drivewsid]; ok {
+				unresolved = append(unresolved, item.FullName())
+			}
+		}
+	}
+	if len(unresolved) != 0 {
+		if mutationErr != nil {
+			return fmt.Errorf("Recently Deleted mutation failed and items remain present: %w", mutationErr)
+		}
+		return fmt.Errorf("Recently Deleted mutation did not reconcile; %d item(s) remain present", len(unresolved))
+	}
+	if mutationErr != nil {
+		fs.Debugf(f, "Recently Deleted mutation returned an error but authenticated READ confirmed the requested transition: %v", mutationErr)
+	}
+	return nil
+}
+
+// CleanUp permanently deletes every item currently present in Recently
+// Deleted. The standard rclone cleanup command intentionally has account-wide
+// trash semantics even when this Fs has a non-root path.
+func (f *Fs) CleanUp(ctx context.Context) error {
+	items, err := f.recentlyDeleted(ctx)
+	if err != nil {
+		return err
+	}
+	return f.mutateRecentlyDeleted(ctx, items, false)
+}
+
 func (f *Fs) listAll(ctx context.Context, dirID string) (items []*api.DriveItem, err error) {
+	id, _ := f.parseNormalizedID(dirID)
+	shared := strings.HasPrefix(id, "SHARED::")
+	if shared {
+		itemID := strings.TrimPrefix(id, "SHARED::")
+		raw, _, err := f.service.GetItemsInFolder(ctx, itemID, 5000)
+		if err != nil {
+			return nil, err
+		}
+		parent := f.sharedItems[id]
+		var canonical []*api.DriveItem
+		if parent != nil {
+			canonical = parent.Items
+			// A Shared directory obtained from the DriveWS response may not
+			// have its children embedded. Enrich from the same READ-only
+			// DriveWS metadata endpoint when the parent has a canonical ID;
+			// enumeration remains the source of the child listing.
+			if len(canonical) == 0 && parent.Drivewsid != "" {
+				if details, _, readErr := f.service.GetItemByDriveID(ctx, parent.Drivewsid, true); readErr == nil && details != nil {
+					canonical = details.Items
+				}
+			}
+		}
+		for _, r := range raw {
+			full, _, e := f.service.GetItemRawByItemID(ctx, r.ItemID)
+			if e != nil {
+				return nil, e
+			}
+			v := full.IntoDriveItem()
+			mergeSharedCanonicalMetadata(v, findSharedCanonicalItem(canonical, r.ItemID))
+			if parent != nil {
+				v.ParentID = parent.Drivewsid
+				v.ShareID = parent.ShareID
+			}
+			items = append(items, v)
+		}
+		return items, nil
+	}
 	var item *api.DriveItem
 	var resp *http.Response
 
@@ -219,6 +382,40 @@ func (f *Fs) listAll(ctx context.Context, dirID string) (items []*api.DriveItem,
 	return items, nil
 }
 
+// findSharedCanonicalItem finds the same object in the authoritative
+// DriveWS metadata response. item_id is the protocol identity shared by the
+// Documents enumerate response and DriveWS metadata; no opaque-token parsing
+// or identifier synthesis is involved.
+func findSharedCanonicalItem(items []*api.DriveItem, itemID string) *api.DriveItem {
+	for _, item := range items {
+		if item != nil && item.Itemid == itemID {
+			return item
+		}
+	}
+	return nil
+}
+
+// mergeSharedCanonicalMetadata preserves enumerate fields while carrying
+// canonical DriveWS/CloudKit identity forward. The synthetic SHARED cache ID
+// is deliberately kept separate from these backend metadata fields.
+func mergeSharedCanonicalMetadata(item, canonical *api.DriveItem) {
+	if item == nil || canonical == nil {
+		return
+	}
+	item.Drivewsid = canonical.Drivewsid
+	item.Docwsid = canonical.Docwsid
+	item.Zone = canonical.Zone
+	item.ParentID = canonical.ParentID
+	item.Etag = canonical.Etag
+	item.ShareID = canonical.ShareID
+	if item.Name == "" {
+		item.Name = canonical.Name
+	}
+	if item.Type == "" {
+		item.Type = canonical.Type
+	}
+}
+
 // List implements fs.Fs.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 	dirRemoteID, err := f.dirCache.FindDir(ctx, dir, false)
@@ -238,6 +435,10 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		name := item.FullName()
 		remote := path.Join(dir, name)
 		if item.IsFolder() {
+			if item.Itemid != "" && (item.ShareID.ShareName != "" || strings.Contains(item.Drivewsid, "SHARED_FOLDER::") || strings.Contains(item.Drivewsid, "FOLDER_IN_SHARED_FOLDER::")) {
+				id = "SHARED::" + item.Itemid
+				f.sharedItems[id] = item
+			}
 			jid := f.putFolderCache(id, item.Etag, remote)
 			d := fs.NewDir(remote, item.DateModified).SetID(jid).SetSize(item.AssetQuota)
 			entries = append(entries, d)
@@ -281,19 +482,22 @@ func (f *Fs) Precision() time.Duration {
 //
 //nolint:all
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
-	// ICloud cooy endpoint is broken. Once they fixed it this can be re-enabled.
-	return nil, fs.ErrorCantCopy
-
 	// note: so many calls its only just faster then a reupload for big files.
 	srcObj, ok := src.(*Object)
 	if !ok {
 		fs.Debugf(src, "Can't copy - not same remote type")
 		return nil, fs.ErrorCantCopy
 	}
+	if srcObj.shared || !strings.HasPrefix(srcObj.driveID, "FILE::") || srcObj.itemID == "" {
+		return nil, fs.ErrorCantCopy
+	}
 
 	file, pathID, _, err := f.FindPath(ctx, remote, true)
 	if err != nil {
 		return nil, err
+	}
+	if !strings.HasPrefix(pathID, "FOLDER::") {
+		return nil, fs.ErrorCantCopy
 	}
 
 	var resp *http.Response
@@ -302,9 +506,9 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	// make a copy
 	if err = f.pacer.Call(func() (bool, error) {
 		info, resp, err = f.service.CopyDocByItemID(ctx, srcObj.itemID)
-		return retryResultUnknown(ctx, resp, err)
+		return false, err
 	}); err != nil {
-		return nil, err
+		return nil, fserrors.NoRetryError(fmt.Errorf("copy mutation outcome requires reconciliation: %w", err))
 	}
 
 	// renaming in CopyDocByID endpoint does not work :/ so do it the hard way
@@ -315,16 +519,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		doc, resp, err = f.service.GetDocByItemID(ctx, info.ItemID)
 		return shouldRetry(ctx, resp, err)
 	}); err != nil {
-		return nil, err
-	}
-
-	// get parentdrive id
-	var dirDoc *api.Document
-	if err = f.pacer.Call(func() (bool, error) {
-		dirDoc, resp, err = f.service.GetDocByItemID(ctx, pathID)
-		return shouldRetry(ctx, resp, err)
-	}); err != nil {
-		return nil, err
+		return nil, fserrors.NoRetryError(fmt.Errorf("copy succeeded but copied item lookup failed: %w", err))
 	}
 
 	// build request
@@ -333,7 +528,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	r := api.NewUpdateFileInfo()
 	r.DocumentID = doc.DocumentID
 	r.Path.Path = file
-	r.Path.StartingDocumentID = dirDoc.DocumentID
+	r.Path.StartingDocumentID = api.GetDocIDFromDriveID(pathID)
 	r.Data.Signature = doc.Data.Signature
 	r.Data.ReferenceSignature = doc.Data.ReferenceSignature
 	r.Data.WrappingKey = doc.Data.WrappingKey
@@ -343,15 +538,15 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 
 	var item *api.DriveItem
 	if err = f.pacer.Call(func() (bool, error) {
-		item, resp, err = f.service.UpdateFile(ctx, &r, api.ZoneFromDriveID(pathID))
-		return retryResultUnknown(ctx, resp, err)
+		item, resp, err = f.service.UpdateFileNoRetry(ctx, &r, api.ZoneFromDriveID(pathID))
+		return false, err
 	}); err != nil {
-		return nil, err
+		return nil, fserrors.NoRetryError(fmt.Errorf("copy succeeded but destination update outcome requires reconciliation: %w", err))
 	}
 
 	o, err := f.NewObjectFromDriveItem(ctx, remote, item)
 	if err != nil {
-		return nil, err
+		return nil, fserrors.NoRetryError(fmt.Errorf("copy succeeded but destination object construction failed: %w", err))
 	}
 	obj := o.(*Object)
 
@@ -461,6 +656,28 @@ func (f *Fs) putFolderCache(id, etag, remote string) string {
 
 // Rmdir implements fs.Fs.
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	directoryID, etag, err := f.FindDir(ctx, dir, false)
+	if err != nil {
+		return err
+	}
+	if strings.HasPrefix(directoryID, "SHARED::") {
+		item := f.sharedItems[directoryID]
+		if item == nil {
+			return fs.ErrorDirNotFound
+		}
+		if item.DirectChildrenCount > 0 {
+			return fs.ErrorDirectoryNotEmpty
+		}
+		resolved, err := f.resolveSharedRenameItem(ctx, sharedRenameItemID(directoryID), directoryID, etag, directoryID)
+		if err != nil {
+			return err
+		}
+		if _, _, err := f.service.DeleteSharedItem(ctx, resolved); err != nil {
+			return err
+		}
+		f.dirCache.FlushDir(dir)
+		return nil
+	}
 	return f.purgeCheck(ctx, dir, true)
 }
 
@@ -479,6 +696,21 @@ func (f *Fs) String() string {
 // This should be implemented by the backend and will be called by the
 // dircache package when appropriate.
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (string, error) {
+	parsedID, _ := f.parseNormalizedID(pathID)
+	if strings.HasPrefix(parsedID, "SHARED::") {
+		parent := f.sharedItems[parsedID]
+		if parent == nil {
+			return "", fs.ErrorDirNotFound
+		}
+		item, _, err := f.service.CreateSharedFolder(ctx, parent, f.opt.Enc.FromStandardName(leaf))
+		if err != nil {
+			return "", err
+		}
+		if item.Itemid != "" {
+			f.sharedItems["SHARED::"+item.Itemid] = item
+		}
+		return f.IDJoin(item.Drivewsid, item.Etag), nil
+	}
 	var item *api.DriveItem
 	var err error
 	var found bool
@@ -536,9 +768,34 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	}
 
 	srcDirectoryID, srcEtag := f.parseNormalizedID(jsrcDirectoryID)
+	// dircache.DirMove returns the source parent ID and its etag. Resolve the
+	// source directory entry as well so cross-zone folder moves carry the
+	// folder's current etag, not the parent's etag.
+	sourceID, sourceEtag, findErr := srcFs.FindDir(ctx, srcRemote, false)
+	srcEtag = selectDirMoveSourceEtag(srcID, srcEtag, sourceID, sourceEtag, findErr)
 	dstDirectoryID, _ := f.parseNormalizedID(jdstDirectoryID)
+	var sourceParent *api.DriveItem
+	if strings.HasPrefix(srcDirectoryID, "SHARED::") {
+		if cached := srcFs.sharedItems[srcDirectoryID]; cached != nil {
+			parentCopy := *cached
+			sourceParent = &parentCopy
+		} else {
+			parentRemote := path.Dir(srcRemote)
+			if parentRemote == "." {
+				parentRemote = ""
+			}
+			if !strings.HasPrefix(parentRemote, "Shared") {
+				parentRemote = path.Join("Shared", parentRemote)
+			}
+			if parentRemote != "" {
+				if resolved, resolveErr := srcFs.resolveSharedObject(ctx, parentRemote); resolveErr == nil {
+					sourceParent = resolved
+				}
+			}
+		}
+	}
 
-	_, err = f.move(ctx, srcID, srcDirectoryID, srcLeaf, srcEtag, dstDirectoryID, dstLeaf)
+	_, err = f.move(ctx, srcID, "", srcDirectoryID, srcLeaf, srcEtag, dstDirectoryID, dstLeaf, srcFs, sourceParent)
 	if err != nil {
 		return err
 	}
@@ -548,7 +805,89 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	return nil
 }
 
-func (f *Fs) move(ctx context.Context, ID, srcDirectoryID, srcLeaf, srcEtag, dstDirectoryID, dstLeaf string) (*api.DriveItem, error) {
+func selectDirMoveSourceEtag(srcID, parentEtag, sourceID, sourceEtag string, findErr error) string {
+	normalizedSrcID := strings.SplitN(srcID, "#", 2)[0]
+	if findErr == nil && sourceID == normalizedSrcID && sourceEtag != "" {
+		return sourceEtag
+	}
+	return parentEtag
+}
+
+func (f *Fs) move(ctx context.Context, ID, srcItemID, srcDirectoryID, srcLeaf, srcEtag, dstDirectoryID, dstLeaf string, sourceFs *Fs, sourceParent *api.DriveItem) (*api.DriveItem, error) {
+	if sourceFs == nil {
+		sourceFs = f
+	}
+	if srcItemID == "" && strings.HasPrefix(ID, "SHARED::") && strings.HasPrefix(srcDirectoryID, "SHARED::") && srcDirectoryID == dstDirectoryID {
+		itemID := sharedRenameItemID(ID)
+		item, err := sourceFs.resolveSharedRenameItem(ctx, itemID, ID, srcEtag, srcDirectoryID)
+		if err != nil {
+			return nil, err
+		}
+		renamed, _, err := f.service.RenameSharedItem(ctx, item, dstLeaf)
+		return renamed, err
+	}
+	if srcItemID != "" && strings.HasPrefix(srcDirectoryID, "SHARED::") && srcDirectoryID == dstDirectoryID {
+		item, err := sourceFs.resolveSharedRenameItem(ctx, srcItemID, ID, srcEtag, srcDirectoryID)
+		if err != nil {
+			return nil, err
+		}
+		renamed, _, err := f.service.RenameSharedItem(ctx, item, dstLeaf)
+		return renamed, err
+	}
+
+	sourceShared := isSharedMoveSource(ID, srcItemID, srcDirectoryID)
+	destinationShared := isSharedDirectoryID(dstDirectoryID)
+	if !sourceShared && isPersonalFileToSharedMove(ID, destinationShared) {
+		return f.movePersonalToShared(ctx, ID, srcItemID, srcDirectoryID, srcLeaf, srcEtag, dstDirectoryID, sourceFs)
+	}
+	if !sourceShared && isPersonalFolderToSharedMove(ID, destinationShared) {
+		return f.movePersonalToShared(ctx, ID, srcItemID, srcDirectoryID, srcLeaf, srcEtag, dstDirectoryID, sourceFs)
+	}
+
+	// Shared-to-Shared moves must use the owner's CloudDocs zone. Files use
+	// documentStructure records; directories use directory/<uuid> records.
+	if sourceShared && destinationShared {
+		sourceItem, err := sourceFs.resolveSharedMoveSourceWithParent(ctx, ID, srcItemID, srcEtag, srcDirectoryID, sourceParent)
+		if err != nil {
+			return nil, err
+		}
+		destinationItem, err := f.resolveSharedMoveItem(ctx, dstDirectoryID)
+		if err != nil {
+			return nil, err
+		}
+		if sourceItem.IsFolder() || strings.HasPrefix(sourceItem.Drivewsid, "FOLDER_IN_SHARED_FOLDER::") || srcItemID == "" {
+			if err := f.service.SharedReparentDirectory(ctx, sourceItem, destinationItem, dstLeaf); err != nil {
+				return nil, err
+			}
+			result := sharedReparentedItem(sourceItem, destinationItem)
+			result.Name = dstLeaf
+			return result, nil
+		}
+		if err := f.service.SharedReparentFile(ctx, sourceItem, destinationItem); err != nil {
+			return nil, err
+		}
+		return sharedReparentedItem(sourceItem, destinationItem), nil
+	}
+
+	// Personal-to-Shared uses the authenticated destination ShareID on the
+	// DriveWS /moveItems envelope. This covers both files and directories and
+	// never falls through to the context-free generic request.
+	if !sourceShared && destinationShared {
+		return f.movePersonalToShared(ctx, ID, srcItemID, srcDirectoryID, srcLeaf, srcEtag, dstDirectoryID, sourceFs)
+	}
+
+	// Shared-to-Personal uses the source ShareID inside items[0], matching the
+	// successful Apple Web request. It is a true server-side move, not a
+	// download/upload or copy/delete fallback.
+	if isSharedObjectToPersonalMove(ID, srcItemID, srcDirectoryID, destinationShared) {
+		sourceItem, err := sourceFs.resolveSharedMoveSourceWithParent(ctx, ID, srcItemID, srcEtag, srcDirectoryID, sourceParent)
+		if err != nil {
+			return nil, err
+		}
+		destinationID, _ := f.parseNormalizedID(dstDirectoryID)
+		item, _, err := f.service.MoveSharedItemToPersonal(ctx, sourceItem, destinationID)
+		return item, err
+	}
 	var resp *http.Response
 	var item *api.DriveItem
 	var err error
@@ -580,6 +919,427 @@ func (f *Fs) move(ctx context.Context, ID, srcDirectoryID, srcLeaf, srcEtag, dst
 	return item, err
 }
 
+func isPersonalFileToSharedMove(id string, destinationShared bool) bool {
+	return strings.HasPrefix(id, "FILE::") && destinationShared
+}
+
+func isPersonalFolderToSharedMove(id string, destinationShared bool) bool {
+	return strings.HasPrefix(id, "FOLDER::") && destinationShared
+}
+
+func (f *Fs) movePersonalToShared(ctx context.Context, id, srcItemID, srcDirectoryID, srcLeaf, srcEtag, dstDirectoryID string, sourceFs *Fs) (*api.DriveItem, error) {
+	destinationItem, err := f.resolveSharedMoveItem(ctx, dstDirectoryID)
+	if err != nil {
+		return nil, err
+	}
+	shared, err := f.service.ResolveSharedDestinationContext(ctx, destinationItem)
+	if err != nil {
+		return nil, err
+	}
+	id, _ = f.parseNormalizedID(id)
+	// DirMove supplies the source parent cache ID/etag, not the source
+	// directory's etag. Resolve the directory itself before constructing
+	// the cross-zone request; sending the parent etag (or an empty etag)
+	// produces a server-side ETAG_CONFLICT for Personal folder moves.
+	moveEtag := srcEtag
+	if srcItemID == "" && moveEtag == "" {
+		moveEtag, err = sourceFs.resolvePersonalMoveSourceEtag(ctx, id, srcDirectoryID, srcLeaf)
+		if err != nil {
+			return nil, err
+		}
+	}
+	item, _, err := f.service.MoveItemByDriveIDWithSharedContext(ctx, id, moveEtag, shared)
+	return item, err
+}
+
+func isSharedDirectoryID(id string) bool {
+	return strings.HasPrefix(id, "SHARED::") || strings.HasPrefix(id, "SHARED_FOLDER::") || strings.HasPrefix(id, "FOLDER_IN_SHARED_FOLDER::")
+}
+
+func isSharedMoveSource(id, itemID, parentID string) bool {
+	return strings.HasPrefix(id, "SHARED::") || strings.HasPrefix(id, "FILE_IN_SHARED_FOLDER::") || strings.HasPrefix(id, "FOLDER_IN_SHARED_FOLDER::") || itemID != "" && strings.HasPrefix(parentID, "SHARED::")
+}
+
+func isSharedObjectToPersonalMove(id, itemID, parentID string, destinationShared bool) bool {
+	return isSharedMoveSource(id, itemID, parentID) && !destinationShared
+}
+
+// resolvePersonalMoveSourceEtag reads the source directory's current etag.
+// DirMove only returns the source parent directory ID and its etag, so its
+// source directory move must not reuse that parent etag in /moveItems.
+func (f *Fs) resolvePersonalMoveSourceEtag(ctx context.Context, id, parentID, leaf string) (string, error) {
+	sourceID, _ := f.parseNormalizedID(id)
+	// The normal Personal listing response already contains the source
+	// directory's current etag. Reuse that authenticated READ path; the
+	// single-item /retrieveItemDetails endpoint rejects this folder lookup on
+	// the current service and is not needed here.
+	if parentID != "" && leaf != "" {
+		item, found, err := f.findLeafItem(ctx, parentID, leaf)
+		if err != nil {
+			return "", fmt.Errorf("Personal move source metadata unavailable: %w", err)
+		}
+		if found && item != nil && item.Etag != "" {
+			if parsed, _ := f.parseNormalizedID(item.Drivewsid); parsed == sourceID || item.Drivewsid == sourceID {
+				return item.Etag, nil
+			}
+		}
+	}
+	// Keep a canonical hierarchy fallback for callers that do not have a
+	// source path. This uses the same authenticated hierarchy endpoint as the
+	// normal READ path rather than guessing an etag.
+	item, _, err := f.service.GetItemByDriveID(ctx, sourceID, true)
+	if err != nil {
+		return "", fmt.Errorf("Personal move source metadata unavailable: %w", err)
+	}
+	if item == nil || item.Etag == "" {
+		return "", fmt.Errorf("Personal move source etag unavailable")
+	}
+	return item.Etag, nil
+}
+
+// resolveSharedMoveSource is the single source-side canonical resolver for
+// all Shared move directions. It keeps SHARED::<item_id> as a lookup key only.
+func (f *Fs) resolveSharedMoveSource(ctx context.Context, id, itemID, etag, parentID string) (*api.DriveItem, error) {
+	return f.resolveSharedMoveSourceWithParent(ctx, id, itemID, etag, parentID, nil)
+}
+
+func (f *Fs) resolveSharedMoveSourceWithParent(ctx context.Context, id, itemID, etag, parentID string, parent *api.DriveItem) (*api.DriveItem, error) {
+	if itemID == "" {
+		itemID = sharedRenameItemID(id)
+	}
+	return f.resolveSharedRenameItemWithParent(ctx, itemID, id, etag, parentID, parent)
+}
+
+// resolveSharedMoveItem resolves a destination directory from the current
+// authenticated Shared hierarchy. The cache is consulted only as a fallback;
+// it is never required to contain the ShareID context.
+func (f *Fs) resolveSharedMoveItem(ctx context.Context, directoryID string) (*api.DriveItem, error) {
+	var cached *api.DriveItem
+	if item := f.sharedItems[directoryID]; item != nil {
+		copy := *item
+		cached = &copy
+	}
+	itemID := sharedRenameItemID(directoryID)
+	rootDriveID, _ := f.parseNormalizedID(f.rootID)
+	roots, _, err := f.service.GetItemsByDriveID(ctx, []string{rootDriveID}, true)
+	if err != nil {
+		return nil, err
+	}
+	var sharedRoot *api.DriveItem
+	for _, candidate := range roots {
+		if root := findSharedRootHierarchyItem(candidate); root != nil {
+			sharedRoot = root
+			break
+		}
+	}
+	if sharedRoot == nil {
+		return nil, fmt.Errorf("Shared destination hierarchy unavailable")
+	}
+	var item *api.DriveItem
+	if itemID != "" {
+		item = findSharedCanonicalHierarchyItem(sharedRoot, itemID)
+	}
+	if item == nil && strings.Contains(directoryID, "::") && !strings.HasPrefix(directoryID, "SHARED::") {
+		item = findSharedCanonicalHierarchyDriveID(sharedRoot, directoryID)
+	}
+	if item != nil && !isCanonicalSharedDirectoryItem(item) {
+		// A hierarchy entry can identify the destination as a folder while
+		// omitting its canonical DriveWS/document identity.  Do not promote
+		// that partial entry (or its cache key) into a write identity.  The
+		// authenticated document lookup is the same identity bridge used for
+		// Shared move sources and supplies the destination's fresh metadata.
+		item = nil
+	}
+	if item == nil && itemID != "" {
+		if doc, _, lookupErr := f.service.GetDocByItemID(ctx, itemID); lookupErr == nil && doc != nil && doc.DocumentID != "" {
+			item = canonicalSharedItemFromDocument(doc, itemID, sharedRoot)
+		}
+	}
+	if item == nil {
+		item = cached
+	}
+	if item == nil {
+		return nil, fs.ErrorDirNotFound
+	}
+	if !isCanonicalSharedDirectoryItem(item) {
+		return nil, fmt.Errorf("Shared move destination is not a directory")
+	}
+	if item.ShareID.ShareName == "" && sharedRoot.ShareID.ShareName != "" {
+		item.ShareID = sharedRoot.ShareID
+	}
+	if item.Drivewsid == "" {
+		return nil, fmt.Errorf("Shared move destination canonical identity unavailable")
+	}
+	if item.ShareID.ShareName == "" || item.ShareID.RecordName == "" || item.ShareID.ZoneID.ZoneName == "" || item.ShareID.ZoneID.OwnerRecordName == "" {
+		return nil, fmt.Errorf("Shared move destination share context unavailable")
+	}
+	return item, nil
+}
+
+func isCanonicalSharedDirectoryItem(item *api.DriveItem) bool {
+	if item == nil || !item.IsFolder() {
+		return false
+	}
+	return strings.HasPrefix(item.Drivewsid, "SHARED_FOLDER::") || strings.HasPrefix(item.Drivewsid, "FOLDER_IN_SHARED_FOLDER::")
+}
+
+// sharedRenameItemID extracts the item_id from the normalized Shared cache
+// identity returned by dircache. The cache value may include the current etag
+// after a '#'; neither the cache namespace nor that etag is part of item_id.
+func sharedRenameItemID(cacheID string) string {
+	if index := strings.IndexByte(cacheID, '#'); index >= 0 {
+		cacheID = cacheID[:index]
+	}
+	return strings.TrimPrefix(cacheID, "SHARED::")
+}
+
+// resolveSharedRenameItem obtains the current Shared protocol identity and
+// share context from authenticated READ metadata. The dircache ID is only a
+// path/cache key and is never promoted to a DriveWS identity.
+func (f *Fs) resolveSharedRenameItem(ctx context.Context, itemID, cacheID, fallbackEtag, parentCacheID string) (*api.DriveItem, error) {
+	return f.resolveSharedRenameItemWithParent(ctx, itemID, cacheID, fallbackEtag, parentCacheID, nil)
+}
+
+func (f *Fs) resolveSharedRenameItemWithParent(ctx context.Context, itemID, cacheID, fallbackEtag, parentCacheID string, preferredParent *api.DriveItem) (*api.DriveItem, error) {
+	// The SHARED::<item_id> value is only a dircache identity. Resolve the
+	// object from the authenticated retrieveItemDetailsInFolders hierarchy,
+	// where DriveWS canonical identity, fresh etag, and the zone-scoped ShareID
+	// arrive together. Do not use the listing/cache representation as the
+	// canonical source and do not derive a DriveWS ID from the cache identity.
+	rootDriveID, _ := f.parseNormalizedID(f.rootID)
+	roots, _, err := f.service.GetItemsByDriveID(ctx, []string{rootDriveID}, true)
+	if err != nil {
+		return nil, err
+	}
+	var sharedRoot *api.DriveItem
+	for _, candidate := range roots {
+		sharedRoot = findSharedRootHierarchyItem(candidate)
+		if sharedRoot != nil {
+			break
+		}
+	}
+	if sharedRoot == nil {
+		return nil, fmt.Errorf("Shared rename canonical hierarchy unavailable")
+	}
+	item := findSharedCanonicalHierarchyItem(sharedRoot, itemID)
+	if item == nil && sharedRoot.Drivewsid != "" {
+		// A root response may omit embedded children. Fetch the Shared root
+		// directly through the same authenticated hierarchy endpoint, without
+		// consulting or warming f.sharedItems.
+		if details, _, readErr := f.service.GetItemsByDriveID(ctx, []string{sharedRoot.Drivewsid}, true); readErr == nil {
+			for _, detail := range details {
+				if found := findSharedCanonicalHierarchyItem(detail, itemID); found != nil {
+					item = found
+					break
+				}
+			}
+		}
+	}
+	if item == nil && parentCacheID != "" {
+		// Nested Shared directories are not always embedded in the root
+		// hierarchy response. Resolve the cached parent only as a READ lookup
+		// key, then fetch that parent's canonical hierarchy and locate the source
+		// there. The cache identity is never promoted to a protocol identity.
+		parentItemID := sharedRenameItemID(parentCacheID)
+		parent := preferredParent
+		if parent == nil {
+			parent = findSharedCanonicalHierarchyItem(sharedRoot, parentItemID)
+		}
+		if parent == nil {
+			// Path resolution may already have authenticated the parent and
+			// retained its canonical DriveWS ID under the cache key. Use that
+			// value only to select the next authenticated hierarchy READ; never
+			// use the cache entry as the source protocol metadata itself.
+			if cached := f.sharedItems[parentCacheID]; cached != nil {
+				parentCopy := *cached
+				parent = &parentCopy
+			}
+		}
+		if parent != nil && parent.Drivewsid != "" {
+			if details, _, readErr := f.service.GetItemsByDriveID(ctx, []string{parent.Drivewsid}, true); readErr == nil {
+				for _, detail := range details {
+					if found := findSharedCanonicalHierarchyItem(detail, itemID); found != nil {
+						item = found
+						break
+					}
+				}
+			}
+		}
+	}
+	if item == nil {
+		// Shared items can be visible to /v1/enumerate before they are included
+		// in the folder hierarchy response. The authenticated document lookup
+		// supplies the canonical document identity; the ShareID still comes only
+		// from the authenticated Shared root context.
+		if doc, _, lookupErr := f.service.GetDocByItemID(ctx, itemID); lookupErr == nil && doc != nil && doc.DocumentID != "" {
+			item = canonicalSharedItemFromDocument(doc, itemID, sharedRoot)
+		}
+	}
+	if item == nil {
+		return nil, fmt.Errorf("Shared rename source canonical metadata unavailable")
+	}
+	itemCopy := *item
+	if !hasSharedShareIdentity(&itemCopy) && hasSharedShareIdentity(sharedRoot) {
+		itemCopy.ShareID = sharedRoot.ShareID
+	}
+	if !hasSharedShareIdentity(&itemCopy) {
+		return nil, fmt.Errorf("Shared rename share context unavailable")
+	}
+	if !strings.HasPrefix(itemCopy.Drivewsid, "FOLDER_IN_SHARED_FOLDER::") && !strings.HasPrefix(itemCopy.Drivewsid, "FILE_IN_SHARED_FOLDER::") {
+		return nil, fmt.Errorf("Shared rename canonical DriveWS identity unavailable")
+	}
+	if itemCopy.Etag == "" {
+		itemCopy.Etag = fallbackEtag
+	}
+	if itemCopy.Etag == "" {
+		return nil, fmt.Errorf("Shared rename fresh etag unavailable")
+	}
+	shareChangeTag, err := f.service.LookupSharedShareChangeTag(ctx, itemCopy.ShareID.RecordName, itemCopy.ShareID.ZoneID.ZoneName, itemCopy.ShareID.ZoneID.OwnerRecordName)
+	if err != nil {
+		return nil, fmt.Errorf("Shared rename shareChangeTag unavailable: %w", err)
+	}
+	itemCopy.ShareID.ShareChangeTag = shareChangeTag
+	if itemCopy.ParentID == "" {
+		itemCopy.ParentID = sharedRoot.Drivewsid
+	}
+	_ = cacheID // cache identity is intentionally not used as protocol identity
+	_ = parentCacheID
+	return &itemCopy, nil
+}
+
+func canonicalSharedItemFromDocument(doc *api.Document, itemID string, sharedRoot *api.DriveItem) *api.DriveItem {
+	if doc == nil || sharedRoot == nil || doc.DocumentID == "" || itemID == "" {
+		return nil
+	}
+	itemType := doc.Type
+	switch itemType {
+	case "FILE", "FILE_IN_SHARED_FOLDER":
+		itemType = "FILE"
+	case "FOLDER", "FOLDER_IN_SHARED_FOLDER":
+		itemType = "FOLDER"
+	default:
+		return nil
+	}
+	zone := sharedRoot.ShareID.ZoneID.ZoneName
+	if zone == "" {
+		zone = "com.apple.CloudDocs"
+	}
+	return &api.DriveItem{
+		Drivewsid: sharedRenameDriveID(itemType, zone, doc.DocumentID),
+		Docwsid:   doc.DocumentID,
+		Itemid:    itemID,
+		Etag:      doc.Etag,
+		Name:      doc.Name,
+		ParentID:  doc.ParentID,
+		Type:      itemType,
+		Size:      doc.Size,
+		ShareID:   sharedRoot.ShareID,
+	}
+}
+
+func findSharedRootHierarchyItem(item *api.DriveItem) *api.DriveItem {
+	if item == nil {
+		return nil
+	}
+	if strings.HasPrefix(item.Drivewsid, "SHARED_FOLDER::") {
+		return item
+	}
+	for _, child := range item.Items {
+		if root := findSharedRootHierarchyItem(child); root != nil {
+			return root
+		}
+	}
+	return nil
+}
+
+// findSharedCanonicalHierarchyItem locates an item in the canonical Shared
+// root response. ShareID is zone-scoped, so a child may inherit the root
+// context when the response omits it on that child.
+func findSharedCanonicalHierarchyItem(root *api.DriveItem, itemID string) *api.DriveItem {
+	if root == nil {
+		return nil
+	}
+	if root.Itemid == itemID {
+		return root
+	}
+	for _, child := range root.Items {
+		if found := findSharedCanonicalHierarchyItem(child, itemID); found != nil {
+			if !hasCompleteSharedShareID(found) && hasCompleteSharedShareID(root) {
+				copy := *found
+				copy.ShareID = root.ShareID
+				return &copy
+			}
+			return found
+		}
+	}
+	return nil
+}
+
+func findSharedCanonicalHierarchyDriveID(root *api.DriveItem, drivewsid string) *api.DriveItem {
+	if root == nil {
+		return nil
+	}
+	if root.Drivewsid == drivewsid {
+		return root
+	}
+	for _, child := range root.Items {
+		if found := findSharedCanonicalHierarchyDriveID(child, drivewsid); found != nil {
+			if !hasCompleteSharedShareID(found) && hasCompleteSharedShareID(root) {
+				copy := *found
+				copy.ShareID = root.ShareID
+				return &copy
+			}
+			return found
+		}
+	}
+	return nil
+}
+
+func hasCompleteSharedShareID(item *api.DriveItem) bool {
+	return item != nil && item.ShareID.ShareName != "" && item.ShareID.RecordName != "" && item.ShareID.ShareChangeTag != "" && item.ShareID.ZoneID.ZoneName != "" && item.ShareID.ZoneID.OwnerRecordName != ""
+}
+
+func hasSharedShareIdentity(item *api.DriveItem) bool {
+	return item != nil && item.ShareID.ShareName != "" && item.ShareID.RecordName != "" && item.ShareID.ZoneID.ZoneName != "" && item.ShareID.ZoneID.OwnerRecordName != ""
+}
+
+func sharedRenameDriveID(itemType, zone, documentID string) string {
+	if zone == "" {
+		zone = "com.apple.CloudDocs"
+	}
+	prefix := itemType
+	if prefix == "FOLDER" {
+		prefix = "FOLDER_IN_SHARED_FOLDER"
+	} else if prefix == "FILE" {
+		prefix = "FILE_IN_SHARED_FOLDER"
+	}
+	return prefix + "::" + zone + "::" + documentID
+}
+
+// prepareSharedRenameItem prepares a READ-enriched item for DriveWS rename.
+// ID is the internal dircache identity and is not necessarily a DriveWS ID.
+func prepareSharedRenameItem(item *api.DriveItem, cacheID, etag string) {
+	if item.Drivewsid == "" {
+		item.Drivewsid = cacheID
+	}
+	item.Etag = etag
+}
+
+// sharedReparentedItem carries the committed Shared location into the result
+// object. It intentionally performs no network refresh; the CloudKit modify
+// response plus the independent reconciliation are the authoritative result.
+func sharedReparentedItem(source, destination *api.DriveItem) *api.DriveItem {
+	if source == nil {
+		return nil
+	}
+	result := *source
+	if destination != nil {
+		result.ParentID = destination.Drivewsid
+		result.ShareID = destination.ShareID
+	}
+	return &result
+}
+
 // Move moves the src object to the specified remote.
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	srcObj, ok := src.(*Object)
@@ -598,7 +1358,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, err
 	}
 
-	item, err := f.move(ctx, srcObj.driveID, srcDirectoryID, srcLeaf, srcObj.etag, dstDirectoryID, dstLeaf)
+	item, err := f.move(ctx, srcObj.driveID, srcObj.itemID, srcDirectoryID, srcLeaf, srcObj.etag, dstDirectoryID, dstLeaf, srcObj.fs, srcObj.fs.sharedItems[srcDirectoryID])
 	if err != nil {
 		return src, err
 	}
@@ -685,13 +1445,15 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	root = strings.Trim(root, "/")
 
 	f := &Fs{
-		name:   name,
-		root:   root,
-		icloud: icloud,
-		rootID: "FOLDER::com.apple.CloudDocs::root",
-		opt:    *opt,
-		m:      m,
-		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		name:          name,
+		root:          root,
+		icloud:        icloud,
+		rootID:        "FOLDER::com.apple.CloudDocs::root",
+		sharedItemIDs: make(map[string]string),
+		sharedItems:   make(map[string]*api.DriveItem),
+		opt:           *opt,
+		m:             m,
+		pacer:         fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
@@ -785,6 +1547,13 @@ func (f *Fs) NewObjectFromDriveItem(ctx context.Context, remote string, item *ap
 }
 
 func (f *Fs) readMetaData(ctx context.Context, path string) (item *api.DriveItem, err error) {
+	fullPath := path
+	if strings.HasPrefix(f.root, "Shared") && !strings.HasPrefix(path, "Shared") {
+		fullPath = strings.TrimRight(f.root, "/") + "/" + strings.TrimLeft(path, "/")
+	}
+	if strings.HasPrefix(fullPath, "Shared") {
+		return f.resolveSharedObject(ctx, fullPath)
+	}
 	leaf, ID, _, err := f.FindPath(ctx, path, false)
 
 	if err != nil {
@@ -807,6 +1576,87 @@ func (f *Fs) readMetaData(ctx context.Context, path string) (item *api.DriveItem
 	return item, nil
 }
 
+// resolveSharedObject resolves a Shared file strictly by parent enumeration.
+// It deliberately does not use path lookup or treat the final file as a dir.
+func (f *Fs) resolveSharedObject(ctx context.Context, remote string) (*api.DriveItem, error) {
+	parts := strings.Split(strings.Trim(remote, "/"), "/")
+	if len(parts) < 2 || parts[0] != "Shared" {
+		return nil, fs.ErrorObjectNotFound
+	}
+	items, err := f.listAll(ctx, f.rootID)
+	if err != nil {
+		return nil, err
+	}
+	var current *api.DriveItem
+	for _, item := range items {
+		if item.FullName() == parts[0] {
+			current = item
+			break
+		}
+	}
+	if current == nil || !current.IsFolder() {
+		return nil, fs.ErrorObjectNotFound
+	}
+	key := "SHARED::" + current.Itemid
+	f.sharedItems[key] = current
+	for _, component := range parts[1:] {
+		children, err := f.listAll(ctx, f.IDJoin(key, current.Etag))
+		if err != nil {
+			return nil, err
+		}
+		var found *api.DriveItem
+		for _, child := range children {
+			if child.FullName() == component {
+				found = child
+				break
+			}
+		}
+		if found == nil {
+			return nil, fs.ErrorObjectNotFound
+		}
+		if found.IsFolder() {
+			current = found
+			key = "SHARED::" + current.Itemid
+			f.sharedItems[key] = current
+			continue
+		}
+		// Shared enumerate records use item_id as their stable identity. If
+		// the enumerate record is abbreviated, enrich it through the Documents
+		// item endpoint. Do not use path lookup or derive an identity from the
+		// opaque token.
+		if found.Docwsid == "" {
+			if raw, _, lookupErr := f.service.GetItemRawByItemID(ctx, found.Itemid); lookupErr == nil && raw != nil {
+				enriched := raw.IntoDriveItem()
+				// Preserve the parent/share context obtained from enumeration.
+				enriched.ParentID = found.ParentID
+				enriched.ShareID = found.ShareID
+				if enriched.Docwsid != "" {
+					found.Docwsid = enriched.Docwsid
+				}
+				if enriched.Drivewsid != "" {
+					found.Drivewsid = enriched.Drivewsid
+				}
+				if enriched.Etag != "" {
+					found.Etag = enriched.Etag
+				}
+			}
+			// Some Shared /v1/item responses contain only item_id and an
+			// opaque download token. Resolve the document identity through
+			// the existing item lookup instead of decoding that token.
+			if found.Docwsid == "" {
+				if doc, _, lookupErr := f.service.GetDocByItemID(ctx, found.Itemid); lookupErr == nil && doc != nil {
+					found.Docwsid = doc.DocumentID
+					found.Drivewsid = doc.DriveID()
+					found.Etag = doc.Etag
+					found.Size = doc.Size
+				}
+			}
+		}
+		return found, nil
+	}
+	return nil, fs.ErrorObjectNotFound
+}
+
 func (o *Object) setMetaData(item *api.DriveItem) (err error) {
 	if item.IsFolder() {
 		return fs.ErrorIsDir
@@ -819,6 +1669,7 @@ func (o *Object) setMetaData(item *api.DriveItem) (err error) {
 	o.itemID = item.Itemid
 	o.etag = item.Etag
 	o.downloadURL = item.DownloadURL()
+	o.shared = item.ShareID.ShareName != "" || strings.HasPrefix(item.Drivewsid, "FILE_IN_SHARED_FOLDER::") || strings.HasPrefix(item.ParentID, "FOLDER_IN_SHARED_FOLDER::") || strings.HasPrefix(item.ParentID, "SHARED_FOLDER::")
 	return nil
 }
 
@@ -855,15 +1706,20 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	var err error
 
 	if err = o.fs.pacer.Call(func() (bool, error) {
-		var url string
+		url := o.downloadURL
 
 		//var doc *api.Document
 		//if o.docID == "" {
 		//doc, resp, err = o.fs.service.GetDocByItemID(ctx, o.itemID)
 		//}
 
-		// Can not get the download url on a item to work, so do it the hard way.
-		url, _, err = o.fs.service.GetDownloadURLByDriveID(ctx, o.driveID)
+		if url == "" {
+			// Can not get the download url on a item to work, so do it the hard way.
+			url, _, err = o.fs.service.GetDownloadURLByDriveID(ctx, o.driveID)
+			if err != nil {
+				return false, err
+			}
+		}
 
 		resp, err = o.fs.service.DownloadFile(ctx, url, options)
 		return shouldRetry(ctx, resp, err)
@@ -883,6 +1739,14 @@ func (o *Object) Remote() string {
 func (o *Object) Remove(ctx context.Context) error {
 	if o.itemID == "" {
 		return nil
+	}
+	if o.shared || strings.HasPrefix(o.driveID, "FILE_IN_SHARED_FOLDER::") {
+		item, err := o.fs.resolveSharedRenameItem(ctx, o.itemID, o.driveID, o.etag, "")
+		if err != nil {
+			return err
+		}
+		_, _, err = o.fs.service.DeleteSharedItem(ctx, item)
+		return err
 	}
 
 	var resp *http.Response
@@ -945,6 +1809,57 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	name := o.fs.opt.Enc.FromStandardName(leaf)
 	var resp *http.Response
+	if strings.HasPrefix(dirID, "SHARED::") {
+		parent := o.fs.sharedItems[dirID]
+		if parent == nil {
+			return errors.New("Shared upload parent identity unavailable")
+		}
+		startingDocumentID, err := api.SharedUploadStartingDocumentID(parent)
+		if err != nil {
+			return err
+		}
+		uploadInfo, _, err := o.fs.service.CreateSharedUpload(ctx, parent, size, name)
+		if err != nil {
+			return err
+		}
+		upload, _, err := o.fs.service.UploadSharedBinary(ctx, in, size, name, uploadInfo.URL)
+		if err != nil {
+			return err
+		}
+		r := api.NewUpdateFileInfo()
+		r.DocumentID = uploadInfo.DocumentID
+		r.Path.Path = name
+		r.Path.StartingDocumentID = startingDocumentID
+		r.Data.Receipt = upload.SingleFile.Receipt
+		r.Data.Signature = upload.SingleFile.Signature
+		r.Data.ReferenceSignature = upload.SingleFile.ReferenceSignature
+		r.Data.WrappingKey = upload.SingleFile.WrappingKey
+		r.Data.Size = upload.SingleFile.Size
+		r.Mtime = modTime.UnixMilli()
+		r.Btime = modTime.UnixMilli()
+		item, _, err := o.fs.service.UpdateSharedFile(ctx, &r, parent.ShareID.ZoneID.OwnerRecordName)
+		if err != nil {
+			return err
+		}
+		// Reconcile through the Shared READ/list path. In particular, do not
+		// use the personal retrieveItemDetails refresh for a Shared object.
+		reconciled, err := o.fs.NewObject(ctx, o.remote)
+		if err != nil {
+			return fmt.Errorf("Shared upload reconciliation: %w", err)
+		}
+		reconciledObject, ok := reconciled.(*Object)
+		if !ok || reconciledObject.itemID != item.Itemid || reconciledObject.size != size || !strings.HasPrefix(item.Drivewsid, "FILE_IN_SHARED_FOLDER::") || item.Itemid == "" || item.Docwsid == "" {
+			return fmt.Errorf("Shared upload reconciliation returned wrong identity or size")
+		}
+		item.ShareID = parent.ShareID
+		item.ParentID = parent.Drivewsid
+		if err := o.setMetaData(item); err != nil {
+			return err
+		}
+		o.modTime = modTime
+		o.size = src.Size()
+		return nil
+	}
 
 	// Create document
 	var uploadInfo *api.UploadResponse
@@ -1010,15 +1925,67 @@ func (f *Fs) Disconnect(ctx context.Context) error {
 	return disconnectClient(f.m, f.icloud)
 }
 
+// Command exposes the Recently Deleted inventory, recovery, and permanent-delete actions.
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (any, error) {
+	switch name {
+	case "recently-deleted":
+		if len(arg) != 0 {
+			return nil, fmt.Errorf("recently-deleted does not accept arguments")
+		}
+		items, err := f.recentlyDeleted(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"count": len(items), "items": items}, nil
+	case "recover", "permanent-delete":
+		items, err := f.recentlyDeleted(ctx)
+		if err != nil {
+			return nil, err
+		}
+		selected, err := f.selectRecentlyDeleted(items, arg, name == "recover")
+		if err != nil {
+			return nil, err
+		}
+		if err := f.mutateRecentlyDeleted(ctx, selected, name == "recover"); err != nil {
+			return nil, err
+		}
+		return map[string]any{"action": name, "items": len(selected), "reconciled": true}, nil
+	default:
+		return nil, fs.ErrorCommandNotFound
+	}
+}
+
+var driveCommandHelp = []fs.CommandHelp{{
+	Name:  "recently-deleted",
+	Short: "List Personal iCloud Drive Recently Deleted items.",
+	Long: `Performs an authenticated read of the Recently Deleted inventory and returns
+the current items and count. This command is read-only; it does not recover or
+delete any items.`,
+}, {
+	Name:  "recover",
+	Short: "Recover selected or all Personal iCloud Drive Recently Deleted items.",
+	Long: `Pass one or more exact item names (or drivewsid values) to recover selected
+items. With no arguments, this recovers every item currently returned by the
+authenticated Recently Deleted inventory. Ambiguous names are rejected.`,
+}, {
+	Name:  "permanent-delete",
+	Short: "Permanently delete selected Personal iCloud Drive Recently Deleted items.",
+	Long: `Pass one or more exact item names (or drivewsid values). At least one item is
+required; use rclone cleanup to empty the entire Recently Deleted collection.
+Ambiguous names are rejected.`,
+}}
+
 // Check interfaces are satisfied
 var (
 	_ fs.Fs              = &Fs{}
 	_ fs.Disconnecter    = (*Fs)(nil)
 	_ fs.Mover           = (*Fs)(nil)
 	_ fs.Purger          = (*Fs)(nil)
+	_ fs.CleanUpper      = (*Fs)(nil)
 	_ fs.DirMover        = (*Fs)(nil)
 	_ fs.DirCacheFlusher = (*Fs)(nil)
 	_ fs.Copier          = (*Fs)(nil)
+	_ fs.Commander       = (*Fs)(nil)
 	_ fs.Object          = &Object{}
 	_ fs.IDer            = (*Object)(nil)
 )

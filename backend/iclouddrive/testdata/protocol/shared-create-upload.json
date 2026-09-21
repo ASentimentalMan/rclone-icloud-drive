@@ -1,0 +1,45 @@
+{
+  "operations": [
+    {
+      "operation": "shared_create_folder",
+      "method": "POST",
+      "endpoint": "/createFolders",
+      "request": {
+        "destinationDrivewsId": "SHARED_FOLDER::com.apple.CloudDocs::<parent-document-id>",
+        "folders": [{"name": "synthetic-folder", "clientId": "FOLDER::com.apple.CloudDocs::TempId-<uuid>"}],
+        "shareID": {"shareName": "<share-name>", "recordName": "<share-record-name>", "zoneID": {"zoneName": "com.apple.CloudDocs", "ownerRecordName": "<owner-record-name>", "zoneType": "REGULAR_CUSTOM_ZONE"}}
+      },
+      "response": {"folders": [{"status": "OK", "type": "FOLDER", "drivewsid": "FOLDER_IN_SHARED_FOLDER::com.apple.CloudDocs::<folder-document-id>", "docwsid": "<folder-document-id>", "item_id": "<folder-item-id>", "etag": "<result-etag>"}]}
+    },
+    {
+      "operation": "shared_upload_initialize",
+      "method": "POST",
+      "endpoint_template": "/ws/com.apple.CloudDocs/upload/web/<owner-record-name>/<share-record-name>?token=<ephemeral-validation-value>",
+      "request": {"filename": "synthetic-file.txt", "type": "FILE", "content_type": "text/plain", "size": 5},
+      "response": [{"url": "<redacted-ephemeral-signed-upload-url>", "document_id": "<new-document-id>"}]
+    },
+    {
+      "operation": "shared_upload_binary",
+      "method": "POST",
+      "endpoint": "<ephemeral-signed-upload-target>",
+      "request": "<five-byte-file-content>",
+      "response": {"singleFile": {"referenceChecksum": "<redacted-reference-signature>", "size": 5, "fileChecksum": "<redacted-signature>", "wrappingKey": "<redacted-wrapping-key>", "receipt": "<redacted-receipt>"}}
+    },
+    {
+      "operation": "shared_upload_commit",
+      "method": "POST",
+      "endpoint_template": "/ws/com.apple.CloudDocs/update/shared/<owner-record-name>?errorBreakdown=true",
+      "request": {
+        "document_id": "<new-document-id>",
+        "path": {"starting_document_id": "<share-record-or-parent-document-id>", "path": "synthetic-file.txt"},
+        "allow_conflict": true,
+        "file_flags": {"is_writable": true, "is_executable": false, "is_hidden": false},
+        "mtime": 1700000000000,
+        "btime": 1700000000000,
+        "command": "add_file",
+        "data": {"signature": "<redacted-signature>", "wrapping_key": "<redacted-wrapping-key>", "reference_signature": "<redacted-reference-signature>", "receipt": "<redacted-receipt>", "size": 5}
+      },
+      "response": {"status": {"status_code": 0}, "results": [{"status": {"status_code": 0}, "document": {"document_id": "<new-document-id>", "item_id": "<new-item-id>", "etag": "<result-etag>", "parent_id": "SHARED_FOLDER::com.apple.CloudDocs::<parent-document-id>", "name": "synthetic-file.txt", "type": "FILE", "size": 5}}]}
+    }
+  ]
+}

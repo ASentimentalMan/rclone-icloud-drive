@@ -1,0 +1,8 @@
+{
+  "operation": "personal_file_server_side_copy",
+  "method": "POST",
+  "endpoint_template": "/v1/item/copy/<personal-item-id>",
+  "request": {"info_to_update": {}},
+  "response": {"item_id": "<new-item-id>", "item_info": {"drivewsid": "FILE::com.apple.CloudDocs::<new-document-id>", "docwsid": "<new-document-id>", "parentId": "FOLDER::com.apple.CloudDocs::<source-parent-id>", "name": "synthetic-file.txt", "type": "FILE", "version": "<result-etag>", "size": "5"}},
+  "restriction": "Personal FILE source only; the copied item is then finalized at the requested Personal destination"
+}

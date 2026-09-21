@@ -42,6 +42,35 @@ type Session struct {
 	needs2FA bool         `json:"-"` // set when SRP signin returns 409
 }
 
+// GetValidateToken returns the token embedded in Apple's web validation
+// cookie. The cookie value is an authenticated session credential and is
+// never persisted or logged separately.
+func (s *Session) GetValidateToken() (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, cookie := range s.Cookies {
+		if cookie == nil || cookie.Name != "X-APPLE-WEBAUTH-VALIDATE" {
+			continue
+		}
+		const marker = ":t="
+		value := cookie.Value
+		versionEnd := strings.IndexByte(value, ':')
+		if versionEnd <= 2 || !strings.HasPrefix(value, "v=") {
+			return "", fmt.Errorf("malformed X-APPLE-WEBAUTH-VALIDATE cookie")
+		}
+		tokenStart := strings.Index(value[versionEnd:], marker)
+		if tokenStart < 0 {
+			return "", fmt.Errorf("X-APPLE-WEBAUTH-VALIDATE cookie missing t")
+		}
+		token := value[versionEnd+tokenStart+len(marker):]
+		if token == "" {
+			return "", fmt.Errorf("X-APPLE-WEBAUTH-VALIDATE cookie has empty t")
+		}
+		return token, nil
+	}
+	return "", fmt.Errorf("X-APPLE-WEBAUTH-VALIDATE cookie unavailable")
+}
+
 // srpInitResponse is the server response from /auth/signin/init
 type srpInitResponse struct {
 	Iteration int    `json:"iteration"`

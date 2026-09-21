@@ -1,25 +1,115 @@
-<!-- markdownlint-disable-next-line first-line-heading no-inline-html -->
-[<img src="https://rclone.org/img/logo_on_light__horizontal_color.svg" width="50%" alt="rclone logo">](https://rclone.org/#gh-light-mode-only)
-<!-- markdownlint-disable-next-line no-inline-html -->
-[<img src="https://rclone.org/img/logo_on_dark__horizontal_color.svg" width="50%" alt="rclone logo">](https://rclone.org/#gh-dark-mode-only)
+# rclone iCloud Drive Shared Folders
 
-[Website](https://rclone.org) |
-[Documentation](https://rclone.org/docs/) |
-[Download](https://rclone.org/downloads/) |
-[Contributing](CONTRIBUTING.md) |
-[Changelog](https://rclone.org/changelog/) |
-[Installation](https://rclone.org/install/) |
-[Forum](https://forum.rclone.org/)
+An unofficial rclone fork focused on reliable iCloud Drive Shared Folder
+operations, including nested Shared folders and shared subdirectories.
 
-[![Build Status](https://github.com/rclone/rclone/workflows/build/badge.svg)](https://github.com/rclone/rclone/actions?query=workflow%3Abuild)
-[![Go Report Card](https://goreportcard.com/badge/github.com/rclone/rclone)](https://goreportcard.com/report/github.com/rclone/rclone)
-[![GoDoc](https://godoc.org/github.com/rclone/rclone?status.svg)](https://godoc.org/github.com/rclone/rclone)
-[![Docker Pulls](https://img.shields.io/docker/pulls/rclone/rclone)](https://hub.docker.com/r/rclone/rclone)
+## About this fork
 
-# Rclone
+This is an unofficial fork of [rclone/rclone](https://github.com/rclone/rclone),
+based on rclone v1.75.1 at upstream commit
+`687d264b689b8c49a67e2e52a8a5e0caa01c04ce`. The work is concentrated in the
+`iclouddrive` backend and is published on the `icloud-drive` branch. It is not
+an official rclone or Apple release, and upstream rclone does not necessarily
+include these changes.
 
-Rclone *("rsync for cloud storage")* is a command-line program to sync files and
-directories to and from different cloud storage providers.
+## Why this fork?
+
+The goal is to make rclone more useful with iCloud Drive Shared folders:
+listing nested Shared folders, reading and writing Shared content, moving files
+between Personal and Shared areas, and handling Recently Deleted items. The
+implementation follows observed iCloud web behavior, which Apple may change
+without notice. Related upstream issue: [rclone/rclone#9477](https://github.com/rclone/rclone/issues/9477).
+
+## Quick Start
+
+Configure an `icloud` remote with `rclone config`, then use the normal rclone
+commands:
+
+```bash
+rclone lsf icloud:
+rclone lsf icloud:Shared
+rclone lsf "icloud:Shared/example-folder" -R
+rclone copy icloud:Shared/example-folder ./example-folder -P
+```
+
+See the [complete iCloud Drive command reference](docs/rclone-icloud-drive-commands.md)
+(English) and the [Chinese command reference](docs/rclone-icloud-commands-CN.md).
+
+## iCloud Drive Commands
+
+| Operation | Command |
+|---|---|
+| List Personal | `rclone lsf icloud:` |
+| List Shared | `rclone lsf icloud:Shared` |
+| List nested Shared content | `rclone lsf "icloud:Shared/<folder>" -R` |
+| Show metadata | `rclone stat icloud:path/to/file --metadata` |
+| Show size | `rclone size icloud:path` |
+| Create a folder | `rclone mkdir icloud:folder/subfolder` |
+| Upload | `rclone copy local:path icloud:destination -P` |
+| Download | `rclone copy icloud:source ./destination -P` |
+| Personal server-side copy | `rclone copyto icloud:source-file icloud:destination-file` |
+| Move or reparent | `rclone moveto icloud:source icloud:destination` |
+| Rename | `rclone moveto icloud:old icloud:new` |
+| List Recently Deleted | `rclone backend recently-deleted icloud:` |
+| Recover selected items | `rclone backend recover icloud: name-or-drivewsid` |
+| Recover All | `rclone backend recover icloud:` |
+| Empty Trash | `rclone cleanup icloud:` |
+
+For full parameters, Personal/Shared examples, cross-area moves, Recently
+Deleted, Duplicate behavior, and safety limits, see the [complete command
+reference](docs/rclone-icloud-drive-commands.md).
+
+## Capability Matrix
+
+| Capability | Status |
+|---|---|
+| Personal listing | Supported |
+| Shared listing | Supported |
+| Nested Shared listing | Supported |
+| Personal download | Supported |
+| Shared download | Supported |
+| Personal upload | Supported |
+| Shared upload | Supported |
+| Personal mkdir | Supported |
+| Shared mkdir | Supported |
+| Personal rename | Supported |
+| Shared rename | Supported |
+| Personal move | Supported |
+| Shared → Shared move/reparent | Supported |
+| Personal → Shared move | Supported |
+| Shared → Personal move | Supported |
+| Shared folder move/reparent | Supported |
+| Recently Deleted listing | Supported |
+| Recover selected items | Supported |
+| Recover All | Supported |
+| Permanent Delete | Supported |
+| Empty Trash | Supported |
+| Personal file Duplicate | Supported |
+| Shared file Duplicate | Unsupported |
+| Folder Duplicate | Unsupported |
+
+## Known Limitations
+
+- Shared file Duplicate is unsupported.
+- Personal folder Duplicate and Shared folder Duplicate are unsupported; the
+  corresponding Web UI operations are not available.
+- This backend depends on private iCloud web behavior rather than a stable,
+  official Apple API.
+
+## Documentation
+
+- [Complete iCloud Drive command reference](docs/rclone-icloud-drive-commands.md)
+- [Chinese command reference](docs/rclone-icloud-commands-CN.md)
+- [Capability matrix](docs/icloud-drive/CAPABILITY-MATRIX.md)
+- [Implementation reconstruction](docs/icloud-drive/RECONSTRUCTION.md)
+- [Sanitized protocol fixture guide](backend/iclouddrive/testdata/protocol/README.md)
+
+## Upstream
+
+This project is based on [rclone](https://github.com/rclone/rclone), an
+open-source command-line program for managing files across cloud storage
+providers. Upstream attribution and the MIT license remain unchanged. This
+fork is not an official rclone release.
 
 ## Storage providers
 
