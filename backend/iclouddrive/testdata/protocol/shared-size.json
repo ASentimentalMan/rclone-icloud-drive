@@ -1,0 +1,22 @@
+{
+  "operation": "shared_size_metadata",
+  "authenticated_sources": [
+    {
+      "method": "POST",
+      "endpoint_template": "/v1/enumerate/<shared-item-id>?limit=5000",
+      "response": {"items": [{"item_id": "<file-item-id>", "item_info": {"drivewsid": "FILE_IN_SHARED_FOLDER::com.apple.CloudDocs::<file-document-id>", "docwsid": "<file-document-id>", "parentId": "SHARED_FOLDER::com.apple.CloudDocs::<shared-root-id>", "type": "FILE", "name": "synthetic-file.txt", "size": "17", "version": "<etag>"}}]}
+    },
+    {
+      "method": "POST",
+      "endpoint_template": "/v1/item/<shared-item-id>",
+      "response": {"item_id": "<file-item-id>", "item_info": {"drivewsid": "FILE_IN_SHARED_FOLDER::com.apple.CloudDocs::<file-document-id>", "docwsid": "<file-document-id>", "parentId": "SHARED_FOLDER::com.apple.CloudDocs::<shared-root-id>", "type": "FILE", "name": "synthetic-file.txt", "size": "17", "version": "<etag>"}}
+    },
+    {
+      "method": "POST",
+      "endpoint": "/retrieveItemDetailsInFolders",
+      "response": [{"drivewsid": "SHARED_FOLDER::com.apple.CloudDocs::<shared-root-id>", "items": [{"item_id": "<file-item-id>", "drivewsid": "FILE_IN_SHARED_FOLDER::com.apple.CloudDocs::<file-document-id>", "docwsid": "<file-document-id>", "type": "FILE", "name": "synthetic-file", "extension": "txt", "size": 17, "etag": "<etag>"}]}]
+    }
+  ],
+  "consumer_paths": ["list", "stat", "size-only"],
+  "known_limitation": "missing size and explicit zero both become int64(0)"
+}

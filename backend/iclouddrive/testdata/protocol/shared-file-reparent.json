@@ -1,0 +1,46 @@
+{
+  "operation": "shared_file_reparent",
+  "method": "POST",
+  "lookup": {
+    "endpoint": "/database/1/com.apple.clouddocs/production/shared/records/lookup",
+    "query": {"remapEnums": "true", "getCurrentSyncToken": "true"},
+    "request": {
+      "zoneID": {"zoneName": "com.apple.CloudDocs", "ownerRecordName": "<owner-record-name>", "zoneType": "REGULAR_CUSTOM_ZONE"},
+      "records": [{"recordName": "documentStructure/<file-document-id>"}]
+    },
+    "response": {
+      "records": [{
+        "recordName": "documentStructure/<file-document-id>",
+        "recordChangeTag": "<fresh-record-change-tag>",
+        "fields": {
+          "basehash": {"value": "<sanitized-bytes>", "type": "BYTES"},
+          "encryptedBasename": {"value": "<sanitized-encrypted-bytes>", "type": "ENCRYPTED_BYTES"},
+          "extension": {"value": "txt", "type": "STRING"}
+        }
+      }]
+    }
+  },
+  "modify": {
+    "endpoint": "/database/1/com.apple.clouddocs/production/shared/records/modify",
+    "request": {
+      "atomic": true,
+      "zoneID": {"zoneName": "com.apple.CloudDocs", "ownerRecordName": "<owner-record-name>", "zoneType": "REGULAR_CUSTOM_ZONE"},
+      "operations": [{
+        "operationType": "update",
+        "record": {
+          "recordName": "documentStructure/<file-document-id>",
+          "recordType": "structure",
+          "recordChangeTag": "<fresh-record-change-tag>",
+          "fields": {
+            "basehash": {"value": "<sanitized-bytes>", "type": "BYTES"},
+            "encryptedBasename": {"value": "<sanitized-encrypted-bytes>", "type": "ENCRYPTED_BYTES"},
+            "extension": {"value": "txt", "type": "STRING"},
+            "parent": {"value": {"recordName": "directory/<destination-document-id>", "action": "VALIDATE", "zoneID": {"zoneName": "com.apple.CloudDocs", "ownerRecordName": "<owner-record-name>", "zoneType": "REGULAR_CUSTOM_ZONE"}}, "type": "REFERENCE"}
+          },
+          "parent": {"recordName": "directory/<destination-document-id>"}
+        }
+      }]
+    },
+    "response": {"records": [{"recordName": "documentStructure/<file-document-id>", "recordChangeTag": "<result-change-tag>"}]}
+  }
+}

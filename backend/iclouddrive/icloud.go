@@ -168,6 +168,7 @@ func init() {
 		Description: "iCloud Drive and Photos",
 		Config:      Config,
 		NewFs:       NewServiceFs,
+		CommandHelp: driveCommandHelp,
 		MetadataInfo: &fs.MetadataInfo{
 			System: map[string]fs.MetadataHelp{
 				"width": {

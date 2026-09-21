@@ -1,0 +1,26 @@
+{
+  "operations": [
+    {
+      "operation": "shared_rename_file",
+      "method": "POST",
+      "endpoint": "/renameItems",
+      "request": {"items": [{"drivewsid": "FILE_IN_SHARED_FOLDER::com.apple.CloudDocs::<file-document-id>", "shareID": {"shareName": "<share-name>", "recordName": "<share-record-name>", "shareChangeTag": "<fresh-share-change-tag>", "zoneID": {"zoneName": "com.apple.CloudDocs", "ownerRecordName": "<owner-record-name>", "zoneType": "REGULAR_CUSTOM_ZONE"}}, "etag": "<fresh-item-etag>", "name": "renamed-file", "extension": "txt"}]},
+      "response": {"items": [{"status": "OK", "drivewsid": "FILE_IN_SHARED_FOLDER::com.apple.CloudDocs::<file-document-id>", "name": "renamed-file", "extension": "txt", "etag": "<result-etag>"}]}
+    },
+    {
+      "operation": "shared_rename_folder",
+      "method": "POST",
+      "endpoint": "/renameItems",
+      "request": {"items": [{"drivewsid": "FOLDER_IN_SHARED_FOLDER::com.apple.CloudDocs::<folder-document-id>", "shareID": {"shareName": "<share-name>", "recordName": "<share-record-name>", "shareChangeTag": "<fresh-share-change-tag>", "zoneID": {"zoneName": "com.apple.CloudDocs", "ownerRecordName": "<owner-record-name>", "zoneType": "REGULAR_CUSTOM_ZONE"}}, "etag": "<fresh-item-etag>", "name": "renamed-folder"}]},
+      "response": {"items": [{"status": "OK", "drivewsid": "FOLDER_IN_SHARED_FOLDER::com.apple.CloudDocs::<folder-document-id>", "name": "renamed-folder", "etag": "<result-etag>"}]}
+    },
+    {
+      "operation": "shared_soft_delete",
+      "method": "POST",
+      "endpoint": "/deleteItems",
+      "request": {"items": [{"drivewsid": "FILE_IN_SHARED_FOLDER::com.apple.CloudDocs::<file-document-id>", "shareID": {"shareName": "<share-name>", "recordName": "<share-record-name>", "shareChangeTag": "<fresh-share-change-tag>", "zoneID": {"zoneName": "com.apple.CloudDocs", "ownerRecordName": "<owner-record-name>", "zoneType": "REGULAR_CUSTOM_ZONE"}}, "etag": "<fresh-item-etag>", "clientId": "FILE_IN_SHARED_FOLDER::com.apple.CloudDocs::<file-document-id>"}]},
+      "response": {"items": [{"status": "OK", "drivewsid": "FILE_IN_SHARED_FOLDER::com.apple.CloudDocs::<file-document-id>", "isDeleted": true}]},
+      "variants": ["FILE_IN_SHARED_FOLDER", "FOLDER_IN_SHARED_FOLDER"]
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "operation": "shared_to_personal_move",
+  "method": "POST",
+  "endpoint": "/moveItems",
+  "request": {
+    "items": [
+      {
+        "drivewsid": "FILE_IN_SHARED_FOLDER::com.apple.CloudDocs::<shared-document-id>",
+        "shareID": {
+          "shareName": "<share-name>",
+          "recordName": "<share-record-name>",
+          "shareChangeTag": "<fresh-share-change-tag>",
+          "zoneID": {
+            "zoneName": "com.apple.CloudDocs",
+            "ownerRecordName": "<owner-record-name>"
+          }
+        },
+        "etag": "<fresh-shared-etag>",
+        "clientId": "FILE_IN_SHARED_FOLDER::com.apple.CloudDocs::<shared-document-id>"
+      }
+    ],
+    "destinationDrivewsId": "FOLDER::com.apple.CloudDocs::<personal-folder-document-id>"
+  },
+  "response": {
+    "items": [
+      {
+        "status": "OK",
+        "drivewsid": "FILE::com.apple.CloudDocs::<shared-document-id>",
+        "etag": "<result-etag>"
+      }
+    ]
+  },
+  "variants": ["FILE_IN_SHARED_FOLDER::com.apple.CloudDocs::<id>", "FOLDER_IN_SHARED_FOLDER::com.apple.CloudDocs::<id>"]
+}

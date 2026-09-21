@@ -1,0 +1,22 @@
+{
+  "inventory": {
+    "method": "POST",
+    "endpoint": "/retrieveItemDetailsInFolders",
+    "request": [{"drivewsid": "TRASH_ROOT", "partialData": false, "includeHierarchy": true}],
+    "response": [{"drivewsid": "TRASH_ROOT", "items": [{"drivewsid": "FILE::com.apple.CloudDocs::<file-document-id>", "etag": "<fresh-file-etag>", "name": "synthetic-file", "extension": "txt", "type": "FILE"}, {"drivewsid": "FOLDER::com.apple.CloudDocs::<folder-document-id>", "etag": "<fresh-folder-etag>", "name": "synthetic-folder", "type": "FOLDER"}]}]
+  },
+  "permanent_delete": {
+    "method": "POST",
+    "endpoint": "/deleteItems",
+    "request": {"items": [{"drivewsid": "FILE::com.apple.CloudDocs::<file-document-id>", "etag": "<fresh-file-etag>", "clientId": "FILE::com.apple.CloudDocs::<file-document-id>"}, {"drivewsid": "FOLDER::com.apple.CloudDocs::<folder-document-id>", "etag": "<fresh-folder-etag>", "clientId": "FOLDER::com.apple.CloudDocs::<folder-document-id>"}]},
+    "response": {"items": []},
+    "semantics": "single and multi differ only by items array length; cleanup sends the full non-empty TRASH_ROOT inventory"
+  },
+  "recover": {
+    "method": "POST",
+    "endpoint": "/putBackItemsFromTrash",
+    "request": {"items": [{"drivewsid": "FILE::com.apple.CloudDocs::<file-document-id>", "etag": "<fresh-file-etag>"}, {"drivewsid": "FOLDER::com.apple.CloudDocs::<folder-document-id>", "etag": "<fresh-folder-etag>"}]},
+    "response": {"items": []},
+    "semantics": "single and multi differ only by items array length; Recover All sends the full non-empty TRASH_ROOT inventory"
+  }
+}

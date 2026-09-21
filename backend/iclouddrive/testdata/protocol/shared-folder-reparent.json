@@ -1,0 +1,34 @@
+{
+  "operation": "shared_folder_reparent",
+  "method": "POST",
+  "lookup": {
+    "endpoint": "/database/1/com.apple.clouddocs/production/shared/records/lookup",
+    "request": {
+      "zoneID": {"zoneName": "com.apple.CloudDocs", "ownerRecordName": "<owner-record-name>", "zoneType": "REGULAR_CUSTOM_ZONE"},
+      "records": [{"recordName": "directory/<UPPERCASE-FOLDER-DOCUMENT-ID>"}]
+    },
+    "response": {"records": [{"recordName": "directory/<UPPERCASE-FOLDER-DOCUMENT-ID>", "recordChangeTag": "<fresh-record-change-tag>", "fields": {"basehash": {"value": "<sanitized-bytes>", "type": "BYTES"}, "encryptedBasename": {"value": "<sanitized-encrypted-bytes>", "type": "ENCRYPTED_BYTES"}}}]}
+  },
+  "modify": {
+    "endpoint": "/database/1/com.apple.clouddocs/production/shared/records/modify",
+    "request": {
+      "atomic": true,
+      "zoneID": {"zoneName": "com.apple.CloudDocs", "ownerRecordName": "<owner-record-name>", "zoneType": "REGULAR_CUSTOM_ZONE"},
+      "operations": [{
+        "operationType": "update",
+        "record": {
+          "recordName": "directory/<UPPERCASE-FOLDER-DOCUMENT-ID>",
+          "recordType": "structure",
+          "recordChangeTag": "<fresh-record-change-tag>",
+          "fields": {
+            "basehash": {"value": "<sanitized-bytes>", "type": "BYTES"},
+            "encryptedBasename": {"value": "<sanitized-encrypted-bytes>", "type": "ENCRYPTED_BYTES"},
+            "parent": {"value": {"recordName": "directory/<destination-document-id>", "action": "VALIDATE", "zoneID": {"zoneName": "com.apple.CloudDocs", "ownerRecordName": "<owner-record-name>", "zoneType": "REGULAR_CUSTOM_ZONE"}}, "type": "REFERENCE"}
+          },
+          "parent": {"recordName": "directory/<destination-document-id>"}
+        }
+      }]
+    },
+    "response": {"records": [{"recordName": "directory/<UPPERCASE-FOLDER-DOCUMENT-ID>", "recordChangeTag": "<result-change-tag>"}]}
+  }
+}
