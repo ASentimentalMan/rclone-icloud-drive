@@ -698,9 +698,9 @@ func (f *Fs) String() string {
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (string, error) {
 	parsedID, _ := f.parseNormalizedID(pathID)
 	if strings.HasPrefix(parsedID, "SHARED::") {
-		parent := f.sharedItems[parsedID]
-		if parent == nil {
-			return "", fs.ErrorDirNotFound
+		parent, err := f.resolveSharedWriteParent(ctx, parsedID)
+		if err != nil {
+			return "", err
 		}
 		item, _, err := f.service.CreateSharedFolder(ctx, parent, f.opt.Enc.FromStandardName(leaf))
 		if err != nil {
@@ -1014,6 +1014,40 @@ func (f *Fs) resolveSharedMoveSourceWithParent(ctx context.Context, id, itemID, 
 // authenticated Shared hierarchy. The cache is consulted only as a fallback;
 // it is never required to contain the ShareID context.
 func (f *Fs) resolveSharedMoveItem(ctx context.Context, directoryID string) (*api.DriveItem, error) {
+	return f.resolveSharedDirectoryItem(ctx, directoryID, true, false)
+}
+
+// resolveSharedWriteParent returns a canonical Shared directory suitable for
+// folder creation or upload. Incomplete cached listing metadata is resolved
+// from authenticated DriveWS or document metadata before it is used for writes.
+func (f *Fs) resolveSharedWriteParent(ctx context.Context, directoryID string) (*api.DriveItem, error) {
+	if cached := f.sharedItems[directoryID]; isCanonicalSharedWriteParent(cached) && hasSharedShareIdentity(cached) {
+		copy := *cached
+		return &copy, nil
+	}
+	item, err := f.resolveSharedDirectoryItem(ctx, directoryID, false, true)
+	if err != nil {
+		return nil, fmt.Errorf("Shared write parent canonical identity unavailable: %w", err)
+	}
+	if !isCanonicalSharedWriteParent(item) || !hasSharedShareIdentity(item) {
+		return nil, fmt.Errorf("Shared write parent canonical identity unavailable")
+	}
+	return item, nil
+}
+
+func isCanonicalSharedWriteParent(item *api.DriveItem) bool {
+	if !isCanonicalSharedDirectoryItem(item) || !hasSharedShareIdentity(item) {
+		return false
+	}
+	if strings.HasPrefix(item.Drivewsid, "FOLDER_IN_SHARED_FOLDER::") {
+		return item.Docwsid != ""
+	}
+	return item.ShareID.RecordName != ""
+}
+
+// resolveSharedDirectoryItem resolves a Shared directory from authenticated
+// metadata. Cached metadata is used only when allowCachedFallback is true.
+func (f *Fs) resolveSharedDirectoryItem(ctx context.Context, directoryID string, allowCachedFallback, requireDocumentID bool) (*api.DriveItem, error) {
 	var cached *api.DriveItem
 	if item := f.sharedItems[directoryID]; item != nil {
 		copy := *item
@@ -1042,7 +1076,7 @@ func (f *Fs) resolveSharedMoveItem(ctx context.Context, directoryID string) (*ap
 	if item == nil && strings.Contains(directoryID, "::") && !strings.HasPrefix(directoryID, "SHARED::") {
 		item = findSharedCanonicalHierarchyDriveID(sharedRoot, directoryID)
 	}
-	if item != nil && !isCanonicalSharedDirectoryItem(item) {
+	if item != nil && (!isCanonicalSharedDirectoryItem(item) || requireDocumentID && strings.HasPrefix(item.Drivewsid, "FOLDER_IN_SHARED_FOLDER::") && item.Docwsid == "") {
 		// A hierarchy entry can identify the destination as a folder while
 		// omitting its canonical DriveWS/document identity.  Do not promote
 		// that partial entry (or its cache key) into a write identity.  The
@@ -1055,16 +1089,19 @@ func (f *Fs) resolveSharedMoveItem(ctx context.Context, directoryID string) (*ap
 			item = canonicalSharedItemFromDocument(doc, itemID, sharedRoot)
 		}
 	}
-	if item == nil {
+	if item == nil && allowCachedFallback {
 		item = cached
 	}
 	if item == nil {
-		return nil, fs.ErrorDirNotFound
+		if allowCachedFallback {
+			return nil, fs.ErrorDirNotFound
+		}
+		return nil, fmt.Errorf("Shared directory canonical metadata unavailable")
 	}
 	if !isCanonicalSharedDirectoryItem(item) {
 		return nil, fmt.Errorf("Shared move destination is not a directory")
 	}
-	if item.ShareID.ShareName == "" && sharedRoot.ShareID.ShareName != "" {
+	if !hasSharedShareIdentity(item) && hasSharedShareIdentity(sharedRoot) {
 		item.ShareID = sharedRoot.ShareID
 	}
 	if item.Drivewsid == "" {
@@ -1074,6 +1111,18 @@ func (f *Fs) resolveSharedMoveItem(ctx context.Context, directoryID string) (*ap
 		return nil, fmt.Errorf("Shared move destination share context unavailable")
 	}
 	return item, nil
+}
+
+func (f *Fs) resolveSharedUploadParent(ctx context.Context, directoryID string) (*api.DriveItem, string, error) {
+	parent, err := f.resolveSharedWriteParent(ctx, directoryID)
+	if err != nil {
+		return nil, "", err
+	}
+	startingDocumentID, err := api.SharedUploadStartingDocumentID(parent)
+	if err != nil {
+		return nil, "", err
+	}
+	return parent, startingDocumentID, nil
 }
 
 func isCanonicalSharedDirectoryItem(item *api.DriveItem) bool {
@@ -1810,11 +1859,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	name := o.fs.opt.Enc.FromStandardName(leaf)
 	var resp *http.Response
 	if strings.HasPrefix(dirID, "SHARED::") {
-		parent := o.fs.sharedItems[dirID]
-		if parent == nil {
-			return errors.New("Shared upload parent identity unavailable")
-		}
-		startingDocumentID, err := api.SharedUploadStartingDocumentID(parent)
+		parent, startingDocumentID, err := o.fs.resolveSharedUploadParent(ctx, dirID)
 		if err != nil {
 			return err
 		}
