@@ -141,7 +141,7 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID string, leaf string) (pathIDOu
 		return "", false, fs.ErrorIsFile
 	}
 
-	if item.Itemid != "" && (item.ShareID.ShareName != "" || strings.Contains(item.Drivewsid, "SHARED_FOLDER::") || strings.Contains(item.Drivewsid, "FOLDER_IN_SHARED_FOLDER::")) {
+	if item.Itemid != "" && (item.ShareID.ShareName != "" || isSharedDirectoryID(item.Drivewsid)) {
 		key := "SHARED::" + item.Itemid
 		f.sharedItems[key] = item
 		return f.IDJoin(key, item.Etag), true, nil
@@ -324,14 +324,32 @@ func (f *Fs) CleanUp(ctx context.Context) error {
 
 func (f *Fs) listAll(ctx context.Context, dirID string) (items []*api.DriveItem, err error) {
 	id, _ := f.parseNormalizedID(dirID)
-	shared := strings.HasPrefix(id, "SHARED::")
-	if shared {
-		itemID := strings.TrimPrefix(id, "SHARED::")
+	if isSharedDirectoryID(id) {
+		parent := f.sharedItems[id]
+		itemID := ""
+		if strings.HasPrefix(id, "SHARED::") {
+			itemID = strings.TrimPrefix(id, "SHARED::")
+		} else if parent != nil {
+			itemID = parent.Itemid
+		}
+		if parent == nil || itemID == "" || !hasSharedShareIdentity(parent) {
+			parent, err = f.resolveSharedDirectoryItem(ctx, id, false, false)
+			if err != nil {
+				return nil, fmt.Errorf("Shared directory listing identity unavailable: %w", err)
+			}
+			if strings.HasPrefix(id, "SHARED::") {
+				itemID = strings.TrimPrefix(id, "SHARED::")
+			} else {
+				itemID = parent.Itemid
+			}
+		}
+		if parent == nil || itemID == "" {
+			return nil, fmt.Errorf("Shared directory listing item identity unavailable")
+		}
 		raw, _, err := f.service.GetItemsInFolder(ctx, itemID, 5000)
 		if err != nil {
 			return nil, err
 		}
-		parent := f.sharedItems[id]
 		var canonical []*api.DriveItem
 		if parent != nil {
 			canonical = parent.Items
@@ -339,7 +357,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string) (items []*api.DriveItem,
 			// have its children embedded. Enrich from the same READ-only
 			// DriveWS metadata endpoint when the parent has a canonical ID;
 			// enumeration remains the source of the child listing.
-			if len(canonical) == 0 && parent.Drivewsid != "" {
+			if len(canonical) == 0 && strings.HasPrefix(parent.Drivewsid, "SHARED_FOLDER::") {
 				if details, _, readErr := f.service.GetItemByDriveID(ctx, parent.Drivewsid, true); readErr == nil && details != nil {
 					canonical = details.Items
 				}
@@ -435,7 +453,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		name := item.FullName()
 		remote := path.Join(dir, name)
 		if item.IsFolder() {
-			if item.Itemid != "" && (item.ShareID.ShareName != "" || strings.Contains(item.Drivewsid, "SHARED_FOLDER::") || strings.Contains(item.Drivewsid, "FOLDER_IN_SHARED_FOLDER::")) {
+			if item.Itemid != "" && (item.ShareID.ShareName != "" || isSharedDirectoryID(item.Drivewsid)) {
 				id = "SHARED::" + item.Itemid
 				f.sharedItems[id] = item
 			}
@@ -660,15 +678,15 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(directoryID, "SHARED::") {
-		item := f.sharedItems[directoryID]
-		if item == nil {
-			return fs.ErrorDirNotFound
+	if isSharedDirectoryID(directoryID) {
+		item, err := f.resolveSharedDirectoryItem(ctx, directoryID, true, false)
+		if err != nil {
+			return err
 		}
 		if item.DirectChildrenCount > 0 {
 			return fs.ErrorDirectoryNotEmpty
 		}
-		resolved, err := f.resolveSharedRenameItem(ctx, sharedRenameItemID(directoryID), directoryID, etag, directoryID)
+		resolved, err := f.resolveSharedRenameItem(ctx, item.Itemid, directoryID, etag, directoryID)
 		if err != nil {
 			return err
 		}
@@ -697,7 +715,7 @@ func (f *Fs) String() string {
 // dircache package when appropriate.
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (string, error) {
 	parsedID, _ := f.parseNormalizedID(pathID)
-	if strings.HasPrefix(parsedID, "SHARED::") {
+	if isSharedDirectoryID(parsedID) {
 		parent, err := f.resolveSharedWriteParent(ctx, parsedID)
 		if err != nil {
 			return "", err
@@ -706,8 +724,18 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (string, error)
 		if err != nil {
 			return "", err
 		}
+		if f.sharedItems == nil {
+			f.sharedItems = make(map[string]*api.DriveItem)
+		}
+		if f.sharedItemIDs == nil {
+			f.sharedItemIDs = make(map[string]string)
+		}
 		if item.Itemid != "" {
 			f.sharedItems["SHARED::"+item.Itemid] = item
+			f.sharedItemIDs[item.Drivewsid] = item.Itemid
+		}
+		if item.Drivewsid != "" {
+			f.sharedItems[item.Drivewsid] = item
 		}
 		return f.IDJoin(item.Drivewsid, item.Etag), nil
 	}
@@ -775,23 +803,12 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	srcEtag = selectDirMoveSourceEtag(srcID, srcEtag, sourceID, sourceEtag, findErr)
 	dstDirectoryID, _ := f.parseNormalizedID(jdstDirectoryID)
 	var sourceParent *api.DriveItem
-	if strings.HasPrefix(srcDirectoryID, "SHARED::") {
+	if isSharedDirectoryID(srcDirectoryID) {
 		if cached := srcFs.sharedItems[srcDirectoryID]; cached != nil {
 			parentCopy := *cached
 			sourceParent = &parentCopy
-		} else {
-			parentRemote := path.Dir(srcRemote)
-			if parentRemote == "." {
-				parentRemote = ""
-			}
-			if !strings.HasPrefix(parentRemote, "Shared") {
-				parentRemote = path.Join("Shared", parentRemote)
-			}
-			if parentRemote != "" {
-				if resolved, resolveErr := srcFs.resolveSharedObject(ctx, parentRemote); resolveErr == nil {
-					sourceParent = resolved
-				}
-			}
+		} else if resolved, resolveErr := srcFs.resolveSharedDirectoryItem(ctx, srcDirectoryID, true, false); resolveErr == nil {
+			sourceParent = resolved
 		}
 	}
 
@@ -817,7 +834,7 @@ func (f *Fs) move(ctx context.Context, ID, srcItemID, srcDirectoryID, srcLeaf, s
 	if sourceFs == nil {
 		sourceFs = f
 	}
-	if srcItemID == "" && strings.HasPrefix(ID, "SHARED::") && strings.HasPrefix(srcDirectoryID, "SHARED::") && srcDirectoryID == dstDirectoryID {
+	if srcItemID == "" && strings.HasPrefix(ID, "SHARED::") && isSharedDirectoryID(srcDirectoryID) && srcDirectoryID == dstDirectoryID {
 		itemID := sharedRenameItemID(ID)
 		item, err := sourceFs.resolveSharedRenameItem(ctx, itemID, ID, srcEtag, srcDirectoryID)
 		if err != nil {
@@ -826,7 +843,7 @@ func (f *Fs) move(ctx context.Context, ID, srcItemID, srcDirectoryID, srcLeaf, s
 		renamed, _, err := f.service.RenameSharedItem(ctx, item, dstLeaf)
 		return renamed, err
 	}
-	if srcItemID != "" && strings.HasPrefix(srcDirectoryID, "SHARED::") && srcDirectoryID == dstDirectoryID {
+	if srcItemID != "" && isSharedDirectoryID(srcDirectoryID) && srcDirectoryID == dstDirectoryID {
 		item, err := sourceFs.resolveSharedRenameItem(ctx, srcItemID, ID, srcEtag, srcDirectoryID)
 		if err != nil {
 			return nil, err
@@ -953,6 +970,9 @@ func (f *Fs) movePersonalToShared(ctx context.Context, id, srcItemID, srcDirecto
 }
 
 func isSharedDirectoryID(id string) bool {
+	if index := strings.IndexByte(id, '#'); index >= 0 {
+		id = id[:index]
+	}
 	return strings.HasPrefix(id, "SHARED::") || strings.HasPrefix(id, "SHARED_FOLDER::") || strings.HasPrefix(id, "FOLDER_IN_SHARED_FOLDER::")
 }
 
@@ -1048,12 +1068,21 @@ func isCanonicalSharedWriteParent(item *api.DriveItem) bool {
 // resolveSharedDirectoryItem resolves a Shared directory from authenticated
 // metadata. Cached metadata is used only when allowCachedFallback is true.
 func (f *Fs) resolveSharedDirectoryItem(ctx context.Context, directoryID string, allowCachedFallback, requireDocumentID bool) (*api.DriveItem, error) {
+	directoryID, _ = f.parseNormalizedID(directoryID)
 	var cached *api.DriveItem
 	if item := f.sharedItems[directoryID]; item != nil {
 		copy := *item
 		cached = &copy
 	}
-	itemID := sharedRenameItemID(directoryID)
+	itemID := ""
+	if strings.HasPrefix(directoryID, "SHARED::") {
+		itemID = strings.TrimPrefix(directoryID, "SHARED::")
+	} else if cached != nil {
+		itemID = cached.Itemid
+	}
+	if itemID == "" {
+		itemID = f.sharedItemIDs[directoryID]
+	}
 	rootDriveID, _ := f.parseNormalizedID(f.rootID)
 	roots, _, err := f.service.GetItemsByDriveID(ctx, []string{rootDriveID}, true)
 	if err != nil {
@@ -1073,7 +1102,7 @@ func (f *Fs) resolveSharedDirectoryItem(ctx context.Context, directoryID string,
 	if itemID != "" {
 		item = findSharedCanonicalHierarchyItem(sharedRoot, itemID)
 	}
-	if item == nil && strings.Contains(directoryID, "::") && !strings.HasPrefix(directoryID, "SHARED::") {
+	if item == nil && isSharedDirectoryID(directoryID) && !strings.HasPrefix(directoryID, "SHARED::") {
 		item = findSharedCanonicalHierarchyDriveID(sharedRoot, directoryID)
 	}
 	if item != nil && (!isCanonicalSharedDirectoryItem(item) || requireDocumentID && strings.HasPrefix(item.Drivewsid, "FOLDER_IN_SHARED_FOLDER::") && item.Docwsid == "") {
@@ -1139,6 +1168,9 @@ func sharedRenameItemID(cacheID string) string {
 	if index := strings.IndexByte(cacheID, '#'); index >= 0 {
 		cacheID = cacheID[:index]
 	}
+	if !strings.HasPrefix(cacheID, "SHARED::") {
+		return ""
+	}
 	return strings.TrimPrefix(cacheID, "SHARED::")
 }
 
@@ -1191,6 +1223,15 @@ func (f *Fs) resolveSharedRenameItemWithParent(ctx context.Context, itemID, cach
 		// there. The cache identity is never promoted to a protocol identity.
 		parentItemID := sharedRenameItemID(parentCacheID)
 		parent := preferredParent
+		if parent == nil {
+			if cached := f.sharedItems[parentCacheID]; cached != nil {
+				parentCopy := *cached
+				parent = &parentCopy
+			}
+		}
+		if parentItemID == "" && parent != nil {
+			parentItemID = parent.Itemid
+		}
 		if parent == nil {
 			parent = findSharedCanonicalHierarchyItem(sharedRoot, parentItemID)
 		}
@@ -1858,7 +1899,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	name := o.fs.opt.Enc.FromStandardName(leaf)
 	var resp *http.Response
-	if strings.HasPrefix(dirID, "SHARED::") {
+	if isSharedDirectoryID(dirID) {
 		parent, startingDocumentID, err := o.fs.resolveSharedUploadParent(ctx, dirID)
 		if err != nil {
 			return err
